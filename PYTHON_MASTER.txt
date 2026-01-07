@@ -1,0 +1,302 @@
+# IMPORT LIBRARIES
+import serial       # Import the library to talk to Arduino via USB
+import matplotlib.pyplot as plt  # Import the plotting library to draw graphs
+import matplotlib.animation as animation  # Import animation tools to make the graph move live
+from collections import deque    # Import 'deque' (double-ended queue), a fast list for storing data
+import time         # Import the time library to track seconds and delays
+
+
+# ==========================================
+# CONFIGURATION SETTINGS
+# ==========================================
+SERIAL_PORT = 'COM11'  # Define which USB port the Arduino is connected to (Must match your computer)
+BAUD_RATE = 9600       # Set the communication speed (Must match 'Serial.begin' in Arduino)
+MAX_DATA_POINTS = 100  # Set the limit of how many points to show on the graph at once (scrolling window)
+
+
+
+# ==========================================
+# CLASS: DATA STORAGE
+# Purpose: Holds the lists of data for the graphs
+# ==========================================
+class SensorData:
+    def __init__(self, maxlen=MAX_DATA_POINTS):
+        # Create a list for Time values, limited to 'maxlen' items. Old items drop off automatically.
+        self.time_data = deque(maxlen=maxlen)
+        # Create a list for Temperature values
+        self.temp_data = deque(maxlen=maxlen)
+        # Create a list for Servo Angle values
+        self.angle_data = deque(maxlen=maxlen)
+        # Create a list for LED Status values (0 or 1)
+        self.led_data = deque(maxlen=maxlen)
+        # Record the exact time the program started so we can start our graph at "0 seconds"
+        self.start_time = time.time()
+
+    def add_data(self, temp, angle, led):
+        # Calculate how many seconds have passed since the start
+        current_time = time.time() - self.start_time
+        # Add the new time to the time list
+        self.time_data.append(current_time)
+        # Add the new temperature to the temp list
+        self.temp_data.append(temp)
+        # Add the new angle to the angle list
+        self.angle_data.append(angle)
+        # Add the new LED state to the LED list
+        self.led_data.append(led)
+
+
+
+# ==========================================
+# CLASS: ARDUINO INTERFACE
+# Purpose: Handles the USB connection and reading text
+# ==========================================
+class ArduinoInterface:
+    def __init__(self, port, baudrate):
+        try:
+            # Attempt to open the serial connection with the specified port and speed
+            self.ser = serial.Serial(port, baudrate, timeout=1)
+            # Pause for 2 seconds to give the Arduino time to reset after connection
+            time.sleep(2)
+            # Print a success message to the console
+            print(f"✓ Connected to Arduino on {port}")
+        except Exception as e:
+            # If connection fails, print the error message
+            print(f"✗ Error connecting to Arduino: {e}")
+            # Print troubleshooting tips for the user
+            print("Please check:")
+            print("  1. Arduino is connected")
+            print("  2. Correct COM port selected")
+            print("  3. No other program is using the port")
+            # Stop the program completely if we can't connect
+            exit()
+
+    def read_line(self):
+        """Read and parse one line from Arduino"""
+        try:
+            # Check if there is data waiting in the serial buffer
+            if self.ser.in_waiting > 0:
+                # Read the line, decode it from bytes to text, and remove whitespace/newlines
+                line = self.ser.readline().decode('utf-8').strip()
+                # Return the clean text line
+                return line
+        except Exception as e:
+            # If reading fails, print the error
+            print(f"Read error: {e}")
+        # If no data or error, return None
+        return None
+
+    def parse_data(self, line):
+        """Parse Arduino output string to find numbers"""
+        # The expected format is: "MODE: AUTO   | Servo: 90 | LED: 1 | Temp: 25C"
+        try:
+            # Initialize variables as None (empty)
+            temp = None
+            angle = None
+            led = None
+
+            # Check if the text "Servo:" is inside the line we received
+            if "Servo:" in line:
+                # Split the text at "Servo:", take the second part, split at "|", and take the number
+                servo_part = line.split("Servo:")[1].split("|")[0].strip()
+                # Convert the text number to an integer
+                angle = int(servo_part)
+
+            # Check if the text "LED:" is inside the line
+            if "LED:" in line:
+                # Split the text to isolate the LED number (0 or 1)
+                led_part = line.split("LED:")[1].split("|")[0].strip()
+                # Convert to integer
+                led = int(led_part)
+
+            # Check if the text "Temp:" is inside the line (Only happens in Auto Mode)
+            if "Temp:" in line:
+                # Split the text to isolate the temperature number
+                temp_part = line.split("Temp:")[1].split("C")[0].strip()
+                # Convert to integer
+                temp = int(temp_part)
+            else:
+                # If "Temp:" is missing (Manual Mode), set temp to 0 so the graph doesn't break
+                temp = 0
+
+            # Return the three extracted numbers
+            return temp, angle, led
+        except Exception as e:
+            # If parsing fails (garbage data), return Nones
+            return None, None, None
+
+    def send_command(self, command):
+        """Send command to Arduino (For Manual Control)"""
+        try:
+            # Convert the string to bytes and send it to Arduino
+            self.ser.write(command.encode())
+            # Print what we sent for debugging
+            print(f"Sent: {command}")
+        except Exception as e:
+            # Print error if sending fails
+            print(f"Send error: {e}")
+
+    def close(self):
+        # Check if the connection is currently open
+        if self.ser.is_open:
+            # Close the connection cleanly
+            self.ser.close()
+
+
+
+# ==========================================
+# CLASS: REALTIME PLOTTER
+# Purpose: Draws and updates the graphs
+# ==========================================
+class RealtimePlotter:
+    def __init__(self, arduino, data_storage):
+        # Store the reference to the arduino object
+        self.arduino = arduino
+        # Store the reference to the data storage object
+        self.data = data_storage
+
+        # Create a figure with 3 rows of plots, share x-axis? No, simpler to keep separate here.
+        # fig is the window, (ax1, ax2, ax3) are the three individual graphs
+        self.fig, (self.ax1, self.ax2, self.ax3) = plt.subplots(3, 1, figsize=(10, 8))
+        # Add a big main title to the window
+        self.fig.suptitle('Mechatronics System - Real-Time Monitoring', fontsize=14, fontweight='bold')
+
+        # --- Setup Graph 1 (Temperature) ---
+        # Create an empty line for Temp, color red ('r-'), width 2
+        self.line_temp, = self.ax1.plot([], [], 'r-', linewidth=2, label='Temperature')
+        # Label the Y-axis
+        self.ax1.set_ylabel('Temperature (°C)', fontsize=10)
+        # Lock the Y-axis range from 0 to 50 degrees
+        self.ax1.set_ylim(0, 50)
+        # Turn on the grid
+        self.ax1.grid(True, alpha=0.3)
+        # Show the legend (key) in the corner
+        self.ax1.legend(loc='upper right')
+        # Draw a dotted red line at 30 to show the Alarm Threshold
+        self.ax1.axhline(y=30, color='r', linestyle='--', alpha=0.5, label='Threshold')
+
+        # --- Setup Graph 2 (Servo Angle) ---
+        # Create an empty line for Servo, color blue ('b-')
+        self.line_angle, = self.ax2.plot([], [], 'b-', linewidth=2, label='Servo Angle')
+        # Label the Y-axis
+        self.ax2.set_ylabel('Servo Angle (°)', fontsize=10)
+        # Lock Y-axis from 0 to 180 degrees
+        self.ax2.set_ylim(0, 180)
+        # Turn on grid
+        self.ax2.grid(True, alpha=0.3)
+        # Show legend
+        self.ax2.legend(loc='upper right')
+
+        # --- Setup Graph 3 (LED State) ---
+        # Create an empty line for LED, color green ('g-')
+        self.line_led, = self.ax3.plot([], [], 'g-', linewidth=2, label='LED State')
+        # Label Y-axis
+        self.ax3.set_ylabel('LED State', fontsize=10)
+        # Label X-axis (only needed on the bottom graph)
+        self.ax3.set_xlabel('Time (seconds)', fontsize=10)
+        # Lock Y-axis slightly below 0 and above 1 for nice spacing
+        self.ax3.set_ylim(-0.5, 1.5)
+        # Only show ticks at 0 and 1
+        self.ax3.set_yticks([0, 1])
+        # Rename 0 to 'OFF' and 1 to 'ON'
+        self.ax3.set_yticklabels(['OFF', 'ON'])
+        # Turn on grid
+        self.ax3.grid(True, alpha=0.3)
+        # Show legend
+        self.ax3.legend(loc='upper right')
+
+        # Automatically adjust layout so labels don't overlap
+        plt.tight_layout()
+
+    def update_plot(self, frame):
+        """This function runs over and over to update the animation"""
+        # Read a line of text from the Arduino
+        line = self.arduino.read_line()
+
+        # If we got a valid line of text...
+        if line:
+            # Print it to the Python console so we can see the raw data
+            print(line)
+
+            # Extract the numbers using our parse function
+            temp, angle, led = self.arduino.parse_data(line)
+
+            # If all three numbers were successfully found...
+            if temp is not None and angle is not None and led is not None:
+                # Add these new numbers to our data storage lists
+                self.data.add_data(temp, angle, led)
+
+                # If we have data in the list...
+                if len(self.data.time_data) > 0:
+                    # Update the Red Temperature Line with new X and Y data
+                    self.line_temp.set_data(self.data.time_data, self.data.temp_data)
+                    # Update the Blue Servo Line
+                    self.line_angle.set_data(self.data.time_data, self.data.angle_data)
+                    # Update the Green LED Line
+                    self.line_led.set_data(self.data.time_data, self.data.led_data)
+
+                    # Update the X-axis (Time) for all 3 graphs to scroll
+                    for ax in [self.ax1, self.ax2, self.ax3]:
+                        # Set X-range from (CurrentTime - 30) to (CurrentTime)
+                        ax.set_xlim(max(0, self.data.time_data[-1] - 30),
+                                    self.data.time_data[-1] + 1)
+
+        # Return the lines that were updated so the animation knows what to redraw
+        return self.line_temp, self.line_angle, self.line_led
+
+    def start(self):
+        """Start the animation loop"""
+        # Create the animation object
+        ani = animation.FuncAnimation(
+            self.fig,               # The figure window to animate
+            self.update_plot,       # The function to call repeatedly
+            interval=100,           # Call it every 100 milliseconds (0.1 seconds)
+            blit=True,              # Optimize drawing (only redraw changed parts)
+            cache_frame_data=False  # Disable caching to prevent warnings
+        )
+        # Open the window and show the graph
+        plt.show()
+
+
+
+# ==========================================
+# MAIN PROGRAM ENTRY POINT
+# ==========================================
+def main():
+    # Print a header to the console
+    print("=" * 50)
+    print("MECHATRONICS SYSTEM DASHBOARD")
+    print("=" * 50)
+    print("\nStarting visualization...")
+
+    # Create the Arduino connection object
+    arduino = ArduinoInterface(SERIAL_PORT, BAUD_RATE)
+    # Create the Data Storage object
+    data_storage = SensorData()
+    # Create the Plotter object
+    plotter = RealtimePlotter(arduino, data_storage)
+
+    # Print instructions for the user
+    print("\n✓ Dashboard ready!")
+    print("\nControls (type in Arduino Serial Monitor):")
+    print("  'A' - Switch to AUTO mode")
+    print("  'M' - Switch to MANUAL mode")
+    print("  'L' - Toggle LED (in manual)")
+    print("  0-180 - Set servo angle (in manual)")
+    print("\nClose the graph window to exit.")
+    print("-" * 50)
+
+    try:
+        # Start the graph (this blocks the code until window is closed)
+        plotter.start()
+    except KeyboardInterrupt:
+        # If user presses Ctrl+C, handle it gracefully
+        print("\n\n✓ Program stopped by user")
+    finally:
+        # When the program ends, ensure the connection is closed
+        arduino.close()
+        print("✓ Connection closed")
+
+
+# Standard Python check: only run 'main' if this file is run directly
+if __name__ == "__main__":
+    main()
